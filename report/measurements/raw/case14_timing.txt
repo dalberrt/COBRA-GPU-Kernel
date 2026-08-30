@@ -1,0 +1,4 @@
+/home/mordax/Desktop/COBRA-GPU-Kernel/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:307: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+shape 14: S=100000 d=1024 H=16 L=2 | 43.5 TFLOP per sequence
+   B  host GiB  reps   median s   s / seq   TFLOP/s  chunk

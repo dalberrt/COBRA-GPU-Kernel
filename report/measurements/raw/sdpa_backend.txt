@@ -1,0 +1,11 @@
+/home/mordax/Desktop/COBRA-GPU-Kernel/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:307: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+ case   hd     S    triton     flash   mem-eff   default  triton vs flash    max_abs
+    1   32   128    0.0238    0.0238    0.0358    0.0227           1.000x   5.64e-04
+    7    8   128    0.0228    0.0225    0.0356    0.0227           0.990x   4.58e-04
+    8  256   128    0.1467    0.1630    0.2412    0.1613           1.112x   5.86e-04
+    9  128   128    0.0226    0.0237    0.0360    0.0228           1.052x   5.58e-04
+   10   64   128    0.0226    0.0238    0.0256    0.0228           1.054x   5.76e-04
+   11    8   128    0.0262    0.0712    0.1183    0.0711           2.721x   5.84e-04
+   12   32    32    0.0197    0.0228    0.0205    0.0228           1.157x   5.84e-04
+   13   32  1024    0.4439    0.4498    1.2193    0.4518           1.013x   5.78e-04
