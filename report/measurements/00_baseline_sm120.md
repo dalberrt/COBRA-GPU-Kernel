@@ -6,15 +6,29 @@ Gate: abs<=0.002 OR rel<=0.02 | dtype=float32 | padding=0.0 | precision=auto
 
 ## Hardware (measured, not assumed)
 
-| Property | Friend's sm_86 (RTX 3090) | This machine: sm_120 (RTX 5060 Ti) |
+| Property | Friend's sm_86 (RTX 3050, Windows/WDDM) | This machine: sm_120 (RTX 5060 Ti, Linux) |
 |---|---|---|
-| SMs | 82 | **36** |
+| SMs | 20 | **36** (1.8x more) |
 | Registers / SM | 65536 | 65536 |
 | Shared mem opt-in / block | 101376 B | 101376 B |
 | Shared mem / SM | 102400 B | 102400 B |
 | Max threads / SM | 1536 | 1536 |
-| L2 cache | 6 MB | **33554432 B (32 MB)** |
-| VRAM total / free | 24 GB | 16616521728 B (15.47 GiB usable) |
+| L2 cache | ~2 MB | **32 MB** (16x more) |
+| VRAM | 8 GB | 15.47 GiB usable |
+| Driver model | **WDDM** (high launch overhead) | **Linux** (low launch overhead) |
+
+The friend's target is recorded in the source itself
+(torch_transformer_benchmark.py:176, "RTX 3050, sm_86, Windows/WDDM"), not
+an RTX 3090. Two consequences drive this whole port:
+
+1. **Launch overhead.** His design note says the baseline is "CPU-DISPATCH-bound,
+   not GPU-bound" and that collapsing ~115 dispatches into one CUDA graph is
+   "the first-order win". That is a WDDM property. On Linux a kernel launch is
+   single-digit microseconds, so the graph gate has to be re-derived rather
+   than inherited (see 2c).
+2. **Occupancy.** 20 SMs -> 36 SMs changes wave quantization for every tile
+   choice. Grids that filled his card leave mine partly idle, and vice versa.
+   His register-pressure ladder was tuned against a 20-SM machine.
 
 Torch 2.11.0+cu128, Triton 3.6.0, CUDA 12.8, Python 3.14.4, driver 595.84.
 
