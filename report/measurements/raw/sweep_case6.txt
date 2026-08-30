@@ -1,0 +1,7 @@
+burn-in (clocks)...
+
+gate: abs<=0.002 OR rel<=0.02 | dtype=float32 | padding=0.0 | precision=auto
+
+  #      B     D   H      S      dt  G   res   failed    max_abs    base ms    opt ms  speedup
+----------------------------------------------------------------------------------------------
+  6  10000   128   4    128   ERROR  OutOfMemoryError: CUDA out of memory. Tried to allocate 2.44 GiB. GPU 0 has a total capa
