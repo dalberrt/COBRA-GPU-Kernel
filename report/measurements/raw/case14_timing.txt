@@ -2,3 +2,7 @@
   cpu = _conversion_method_template(device=torch.device("cpu"))
 shape 14: S=100000 d=1024 H=16 L=2 | 43.5 TFLOP per sequence
    B  host GiB  reps   median s   s / seq   TFLOP/s  chunk
+   2      1.53     3       2.31      1.15      37.7      1
+   4      3.05     3       4.56      1.14      38.1      1
+   8      6.10     3       9.14      1.14      38.1      1
+  32     24.41     2      37.67      1.18      36.9      1
