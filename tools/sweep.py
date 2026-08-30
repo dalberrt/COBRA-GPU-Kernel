@@ -100,7 +100,9 @@ def run_case_streamed(spec, dtype, rtol, atol, trials, padding):
 
     # ---- correctness: `rows` sequences at the full S=100000 -----------------
     sub = bm.TransformerConfig(rows, S, D, H, F, L, True)
-    reference = make_chunked_reference(sub, block_q=2048)
+    # block_q left to the oracle's own memory planner: at B=2, H=16,
+    # S=100000 a fixed 2048 asks for a 26 GB score block.
+    reference = make_chunked_reference(sub)
     optimized = bm.UserOptimizedTransformer(sub)
     bm.copy_model_weights(reference, optimized, strict=True)
     reference = reference.to(device=device, dtype=dtype).eval()
