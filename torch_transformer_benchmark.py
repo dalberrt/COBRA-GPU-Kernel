@@ -1385,11 +1385,19 @@ class UserOptimizedTransformer(BaselineTransformer):
         """True when the whole batch cannot be processed in one GPU pass."""
         if not (torch.cuda.is_available() and x.dim() == 3):
             return False
+        # A host-resident input has to be staged through the device whatever
+        # its size -- the parameters live on the GPU and there is no other
+        # path.  This test must precede the size gate below: a 819 MiB host
+        # tensor is under _STREAM_MIN_BYTES but still cannot be fed to CUDA
+        # weights directly.
+        params_on_gpu = self.final_norm.weight.is_cuda
+        if not params_on_gpu:
+            return False                      # pure-CPU inference: nothing to stage
+        if x.device.type != "cuda":
+            return True
         nbytes = x.numel() * x.element_size()
         if nbytes < _STREAM_MIN_BYTES:
             return False                      # small shapes skip the check
-        if x.device.type != "cuda":
-            return True                       # host-resident: must stage anyway
         if x.shape[0] < 2:
             return False                      # nothing left to split
         free, _total = torch.cuda.mem_get_info()
