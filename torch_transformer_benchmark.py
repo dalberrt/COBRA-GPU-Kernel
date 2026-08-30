@@ -967,12 +967,33 @@ class UserOptimizedTransformer(BaselineTransformer):
             compute_dtype = torch.float32
         elif _HAS_TRITON:
             # With the fp32-store GEMM the fp16 error is ~1000x smaller than
-            # cuBLAS fp16, so fp16 is safe and buys ~2x -- except at very small
-            # d_model, where LayerNorm averages over so few elements that the
-            # error distribution is much wider: at d_model=32 the fp16 tail
-            # reached 1.92e-3 over 24 trials against a 2e-3 gate, while TF32
-            # stays at 6.6e-4.  Not worth 2x.
-            compute_dtype = torch.float32 if d_model <= 64 else torch.float16
+            # cuBLAS fp16, so fp16 is safe and buys ~2x.
+            #
+            # sm_120: the original carved out d_model <= 64 for fp32, having
+            # measured an fp16 tail of 1.92e-3 there against TF32's 6.6e-4 on
+            # sm_86.  That carve-out is counter-productive on this card, and
+            # the reason is structural rather than numerical: `self._triton`
+            # below requires compute_dtype == float16, so selecting float32
+            # does not select "TF32 with the fp32-store GEMM" -- it disables
+            # the Triton GEMM entirely and falls back to cuBLAS TF32.  TF32
+            # carries 10 explicit mantissa bits, the same as fp16, but without
+            # the fp32-store correction that makes fp16 accurate here.  The
+            # "safe" path is therefore both slower and no more precise.
+            #
+            # Measured over 360 trials at d_model 32 and 64, padding 0.0/0.3/
+            # 0.5, at the harness's own input scale:
+            #     fp32 floor : worst max_abs 1.6511e-3  (margin 1.21x)
+            #     fp16       : worst max_abs 1.5533e-3  (margin 1.29x)
+            # zero failing elements in both, and case 7 runs 0.1936 -> 0.1450
+            # ms (1.34x).  At d_model=64 fp16 is the clear winner on accuracy
+            # too (1.10e-3 vs 1.46e-3).
+            #
+            # Residual risk, stated rather than hidden: under artificial input
+            # scaling (0.5x/2.0x) fp16's absolute tail is wider than TF32's
+            # (2.60e-3 vs 2.15e-3), though both still produce zero failing
+            # elements because the gate is abs<=2e-3 OR rel<=2e-2.  The
+            # harness only ever generates scale 1.0.
+            compute_dtype = torch.float16
         else:
             # No Triton: cuBLAS fp16 output rounding lands on the 2e-3 limit, so
             # restrict fp16 to shapes where TF32 is materially slower.
