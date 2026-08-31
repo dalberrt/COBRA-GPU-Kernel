@@ -1053,7 +1053,17 @@ class UserOptimizedTransformer(BaselineTransformer):
             # the separate token-parallel GEMM wins.  Measured -6.1% at B=1,
             # +16.6% at B=4.
             and batch * self.config.num_heads >= 16
-            and seq_len <= 128 and 16 <= head_dim <= 64 and d_model <= 128
+            # sm_120: a lower seq_len bound, which the original did not need.
+            # The fusion requires BM >= S so that no k/v tile is projected
+            # twice, which means the QKV projection's tile height is bounded
+            # by the sequence length.  At S=32 that leaves a 32-row GEMM tile
+            # and the projection is worth less than it costs: measured on
+            # case 12, fused 0.132/0.134 ms vs unfused 0.117/0.118 ms across
+            # two runs each, i.e. the separate token-parallel GEMM is 1.13x
+            # faster.  At S=128 the fusion wins again (case 10: 0.372 fused
+            # vs 0.400 unfused) and is also more accurate, so the bound is
+            # placed between them rather than removing the fusion.
+            and 64 <= seq_len <= 128 and 16 <= head_dim <= 64 and d_model <= 128
             and compute_dtype == torch.float16
         )
         self._qkv_cfgs = (
