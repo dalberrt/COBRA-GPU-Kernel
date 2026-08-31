@@ -1,0 +1,21 @@
+burn-in (clocks)...
+
+gate: abs<=0.002 OR rel<=0.02 | dtype=float32 | padding=0.0 | precision=auto
+
+  #      B     D   H      S      dt  G   res   failed    max_abs    base ms    opt ms  speedup
+----------------------------------------------------------------------------------------------
+  1     64   128   4    128 float16  Y  PASS        0  1.017e-03      1.983     0.387    5.13x
+  2      1   128   4    128 float16  Y  PASS        0  7.181e-04      0.994     0.061   16.29x
+  3      4   128   4    128 float16  Y  PASS        0  8.096e-04      0.956     0.075   12.70x
+  4     16   128   4    128 float16  Y  PASS        0  1.047e-03      0.960     0.120    8.02x
+  5    128   128   4    128 float16  Y  PASS        0  1.076e-03      7.124     0.766    9.30x
+  7     64    32   4    128 float16  Y  PASS        0  1.345e-03      1.429     0.146    9.77x
+  8     64  1024   4    128 float16  Y  PASS        0  1.181e-03     29.759    10.418    2.86x
+  9     64   128   1    128 float16  Y  PASS        0  1.101e-03      1.227     0.413    2.97x
+ 10     64   128   2    128 float16  Y  PASS        0  1.135e-03      1.497     0.372    4.03x
+ 11     64   128  16    128 float16  Y  PASS        0  1.006e-03     10.937     0.431   25.37x
+ 12     64   128   4     32 float16  Y  PASS        0  1.025e-03      0.963     0.132    7.30x
+ 13     64   128   4   1024 float16  Y  PASS        0  1.085e-03    172.714     5.172   33.40x
+
+passed 12/12
+speedup over passing cases: min=2.86x  median=8.66x  max=33.40x

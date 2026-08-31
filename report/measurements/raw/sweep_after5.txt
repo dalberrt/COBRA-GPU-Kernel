@@ -1,0 +1,20 @@
+
+gate: abs<=0.002 OR rel<=0.02 | dtype=float32 | padding=0.0 | precision=auto
+
+  #      B     D   H      S      dt  G   res   failed    max_abs    base ms    opt ms  speedup
+----------------------------------------------------------------------------------------------
+  1     64   128   4    128 float16  Y  PASS        0  1.017e-03      1.997     0.385    5.19x
+  2      1   128   4    128 float16  Y  PASS        0  7.181e-04      0.983     0.061   16.11x
+  3      4   128   4    128 float16  Y  PASS        0  8.096e-04      0.946     0.081   11.61x
+  4     16   128   4    128 float16  Y  PASS        0  1.047e-03      0.951     0.122    7.81x
+  5    128   128   4    128 float16  Y  PASS        0  1.076e-03      7.124     0.739    9.64x
+  7     64    32   4    128 float16  Y  PASS        0  1.345e-03      1.430     0.146    9.78x
+  8     64  1024   4    128 float16  Y  PASS        0  1.181e-03     29.832    10.409    2.87x
+  9     64   128   1    128 float16  Y  PASS        0  1.101e-03      1.227     0.412    2.97x
+ 10     64   128   2    128 float16  Y  PASS        0  1.135e-03      1.499     0.368    4.07x
+ 11     64   128  16    128 float16  Y  PASS        0  1.006e-03     10.932     0.432   25.33x
+ 12     64   128   4     32 float16  Y  PASS        0  1.007e-03      0.952     0.118    8.09x
+ 13     64   128   4   1024 float16  Y  PASS        0  1.085e-03    172.566     5.175   33.34x
+
+passed 12/12
+speedup over passing cases: min=2.87x  median=8.87x  max=33.34x

@@ -1,0 +1,18 @@
+/home/mordax/Desktop/COBRA-GPU-Kernel/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:307: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+burn-in...
+
+  #      B      S    x bytes  shipped  graph ms  eager ms  graph win  verdict
+  1     64    128       4.0M    graph    0.3845    0.4139     1.076x  graph
+  2      1    128       0.1M    graph    0.0610    0.4782     7.840x  graph
+  3      4    128       0.2M    graph    0.0753    0.4032     5.352x  graph
+  4     16    128       1.0M    graph    0.1204    0.3987     3.311x  graph
+  5    128    128       8.0M    graph    0.7379    0.7410     1.004x  tie
+  6  10000    128     625.0M    eager   82.9233   79.7005     0.961x  eager
+  7     64    128       1.0M    graph    0.1934    0.4320     2.233x  graph
+  8     64    128      32.0M    graph   10.4792   10.3962     0.992x  tie
+  9     64    128       4.0M    graph    0.4104    0.4937     1.203x  graph
+ 10     64    128       4.0M    graph    0.3662    0.4088     1.116x  graph
+ 11     64    128       4.0M    graph    0.4297    0.4890     1.138x  graph
+ 12     64     32       1.0M    graph    0.1338    0.3985     2.979x  graph
+ 13     64   1024      32.0M    graph    5.1682    5.0596     0.979x  eager   <-- gate disagrees

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import math
 import statistics
 import time
@@ -212,6 +213,21 @@ _USE_FUSED_QKV_ATTN = True
 # both padding regimes, and all of the seeds the harness actually uses.
 # Set to False to trade the ~11% back for the wider margin.
 _FUSE_LN_IN_GEMM = True
+
+# ---------------------------------------------------------------------------
+# Batch streaming for shapes whose input/output pair cannot be VRAM-resident.
+#
+# Test shape 14 is B=32, S=100000, d_model=1024.  In fp32 the input tensor
+# alone is 12.21 GiB and the output is another 12.21 GiB -- 24.4 GiB against
+# 15.47 GiB of usable VRAM on this card.  No kernel change can fix that: the
+# pair does not fit, so the batch has to be walked in chunks and the chunk
+# size has to come from the device's ACTUAL free memory rather than a constant
+# baked in against some other GPU.
+#
+# Below _STREAM_MIN_BYTES the check is skipped entirely so the small shapes,
+# which are launch-bound, never pay for it.
+_STREAM_MIN_BYTES = 1 << 30      # 1 GiB
+_STREAM_SAFETY = 0.60            # fraction of free VRAM the live set may use
 
 try:  # Triton is optional; everything degrades to cuBLAS without it.
     import triton
@@ -773,12 +789,32 @@ if _HAS_TRITON:
 
     def _attn_cfgs(seq_len, head_dim):
         """Measured tiles.  Deliberately no @triton.autotune: nothing may
-        benchmark or synchronize during CUDA-graph capture."""
+        benchmark or synchronize during CUDA-graph capture.
+
+        Re-derived for sm_120 with tools/tune_attn.py + tools/confirm_attn.py.
+        Most of the sm_86 ladder reproduced under a head-to-head and is kept
+        unchanged -- at these shapes the kernel is latency-bound, not
+        tile-bound, and every config lands within noise of ~0.022 ms.  The two
+        branches marked sm_120 below are the changes that did reproduce.
+        """
         hd_pad = max(16, triton.next_power_of_2(head_dim))
         if seq_len <= 64:
             base = (32, 32, 4, 2)
+        elif hd_pad >= 256:
+            # sm_120: head_dim=256 is reachable now (see the gate in
+            # _prepare).  A (64,64) tile at hd_pad=256 needs 160 KB of shared
+            # memory and cannot launch on a 101376 B budget; this one fits in
+            # 64 KB and beats SDPA by 1.12x measured.
+            base = (32, 16, 4, 3)
         elif hd_pad >= 128:
             base = (64, 64, 4, 2)
+        elif hd_pad == 64 and seq_len <= 128:
+            # sm_120: 0.0276 -> 0.0226 ms (1.22x) at case 10's shape.  The
+            # smaller query tile trades per-CTA work for a 4x larger grid,
+            # which is what a 36-SM part wants when the head count is low --
+            # case 10 is H=2, so BM=64 yields only 256 CTAs (7.1 waves with a
+            # ragged tail) while BM=16 yields 1024 (28.4 waves).
+            base = (16, 32, 4, 1)
         elif hd_pad >= 64 or seq_len >= 512:
             base = (64, 64, 4, 3)
         elif hd_pad >= 32:
@@ -931,12 +967,33 @@ class UserOptimizedTransformer(BaselineTransformer):
             compute_dtype = torch.float32
         elif _HAS_TRITON:
             # With the fp32-store GEMM the fp16 error is ~1000x smaller than
-            # cuBLAS fp16, so fp16 is safe and buys ~2x -- except at very small
-            # d_model, where LayerNorm averages over so few elements that the
-            # error distribution is much wider: at d_model=32 the fp16 tail
-            # reached 1.92e-3 over 24 trials against a 2e-3 gate, while TF32
-            # stays at 6.6e-4.  Not worth 2x.
-            compute_dtype = torch.float32 if d_model <= 64 else torch.float16
+            # cuBLAS fp16, so fp16 is safe and buys ~2x.
+            #
+            # sm_120: the original carved out d_model <= 64 for fp32, having
+            # measured an fp16 tail of 1.92e-3 there against TF32's 6.6e-4 on
+            # sm_86.  That carve-out is counter-productive on this card, and
+            # the reason is structural rather than numerical: `self._triton`
+            # below requires compute_dtype == float16, so selecting float32
+            # does not select "TF32 with the fp32-store GEMM" -- it disables
+            # the Triton GEMM entirely and falls back to cuBLAS TF32.  TF32
+            # carries 10 explicit mantissa bits, the same as fp16, but without
+            # the fp32-store correction that makes fp16 accurate here.  The
+            # "safe" path is therefore both slower and no more precise.
+            #
+            # Measured over 360 trials at d_model 32 and 64, padding 0.0/0.3/
+            # 0.5, at the harness's own input scale:
+            #     fp32 floor : worst max_abs 1.6511e-3  (margin 1.21x)
+            #     fp16       : worst max_abs 1.5533e-3  (margin 1.29x)
+            # zero failing elements in both, and case 7 runs 0.1936 -> 0.1450
+            # ms (1.34x).  At d_model=64 fp16 is the clear winner on accuracy
+            # too (1.10e-3 vs 1.46e-3).
+            #
+            # Residual risk, stated rather than hidden: under artificial input
+            # scaling (0.5x/2.0x) fp16's absolute tail is wider than TF32's
+            # (2.60e-3 vs 2.15e-3), though both still produce zero failing
+            # elements because the gate is abs<=2e-3 OR rel<=2e-2.  The
+            # harness only ever generates scale 1.0.
+            compute_dtype = torch.float16
         else:
             # No Triton: cuBLAS fp16 output rounding lands on the 2e-3 limit, so
             # restrict fp16 to shapes where TF32 is materially slower.
@@ -975,7 +1032,13 @@ class UserOptimizedTransformer(BaselineTransformer):
             and self._triton_available()
             and not self._reference_ops
             and self.config.causal
-            and head_dim <= 128
+            # sm_120: was head_dim <= 128, which sent case 8 (head_dim=256)
+            # to SDPA entirely.  The friend measured hd=256 "at parity with
+            # CUTLASS" on sm_86; on this card the Triton kernel is 1.12x
+            # faster than SDPA (0.1450 ms vs 0.1624 ms), so the gate is
+            # raised.  Attention is ~5% of case 8's runtime, so this is worth
+            # about 1.05x on that case -- real, but not the headline.
+            and head_dim <= 256
             and batch <= 65535
             and _PRECISION_POLICY != "tf32"
             and compute_dtype in (torch.float16, torch.float32)
@@ -990,7 +1053,17 @@ class UserOptimizedTransformer(BaselineTransformer):
             # the separate token-parallel GEMM wins.  Measured -6.1% at B=1,
             # +16.6% at B=4.
             and batch * self.config.num_heads >= 16
-            and seq_len <= 128 and 16 <= head_dim <= 64 and d_model <= 128
+            # sm_120: a lower seq_len bound, which the original did not need.
+            # The fusion requires BM >= S so that no k/v tile is projected
+            # twice, which means the QKV projection's tile height is bounded
+            # by the sequence length.  At S=32 that leaves a 32-row GEMM tile
+            # and the projection is worth less than it costs: measured on
+            # case 12, fused 0.132/0.134 ms vs unfused 0.117/0.118 ms across
+            # two runs each, i.e. the separate token-parallel GEMM is 1.13x
+            # faster.  At S=128 the fusion wins again (case 10: 0.372 fused
+            # vs 0.400 unfused) and is also more accurate, so the bound is
+            # placed between them rather than removing the fusion.
+            and 64 <= seq_len <= 128 and 16 <= head_dim <= 64 and d_model <= 128
             and compute_dtype == torch.float16
         )
         self._qkv_cfgs = (
@@ -1286,6 +1359,154 @@ class UserOptimizedTransformer(BaselineTransformer):
         # 625 MB copy.
         return self._static_out
 
+    # -- batch streaming for out-of-VRAM shapes -------------------------------
+
+    def _activation_bytes_per_seq(self, seq_len: int, in_elem: int) -> int:
+        """Live bytes one sequence occupies inside `_run`.
+
+        Counts the tensors simultaneously alive at the widest point of the
+        fused pipeline.  Per token, with fp16 compute and an fp32 residual:
+
+            fp32 residual carried across layers      d * 4
+            normed activations h                     d * 2
+            fused qkv                            3 * d * 2
+            attention context                        d * 2
+            attention output / new residual          d * 4
+            ffn hidden                               f * 2
+            ffn output / new residual                d * 4
+            staged input + output chunk          2 * d * in_elem
+
+        CALIBRATION: at S=100000, d=f=1024, L=2 that formula gives 28.8 KB per
+        token, but the measured peak is 37.6 KB (3.54, 3.49, 3.47 GiB at B=1,
+        2, 3 -- see report/measurements/02_case14.md).  The gap is caching
+        allocator block reuse and transient copies, so a 1.35x factor is
+        applied.  The factor is measured on this card, not assumed; and the
+        chunk loop halves on OOM regardless, so an underestimate costs a retry
+        rather than a failure.
+        """
+        d = self.config.d_model
+        f = self.config.ffn_dim
+        cdt = 2 if self._cdt in (torch.float16, torch.bfloat16) else 4
+        per_token = (
+            d * 4                   # fp32 residual carried across layers
+            + d * cdt               # normed h
+            + 3 * d * cdt           # fused qkv
+            + d * cdt               # attention context
+            + d * 4                 # attention out / new residual
+            + f * cdt               # ffn hidden
+            + d * 4                 # ffn out / new residual
+            + 2 * d * in_elem       # staged input chunk + output chunk
+        )
+        return int(seq_len * per_token * 1.35)
+
+    def _stream_chunk_size(self, x: torch.Tensor) -> int:
+        """Sequences per GPU pass, derived from real free memory.
+
+        Queried per call rather than cached: the harness allocates and frees
+        the reference output between trials, so free memory genuinely moves
+        between one forward and the next.
+        """
+        batch, seq_len, _ = x.shape
+        per_seq = self._activation_bytes_per_seq(seq_len, x.element_size())
+        free, _total = torch.cuda.mem_get_info()
+        budget = int(free * _STREAM_SAFETY)
+        return max(1, min(batch, budget // max(1, per_seq)))
+
+    def _should_stream(self, x: torch.Tensor) -> bool:
+        """True when the whole batch cannot be processed in one GPU pass."""
+        if not (torch.cuda.is_available() and x.dim() == 3):
+            return False
+        # A host-resident input has to be staged through the device whatever
+        # its size -- the parameters live on the GPU and there is no other
+        # path.  This test must precede the size gate below: a 819 MiB host
+        # tensor is under _STREAM_MIN_BYTES but still cannot be fed to CUDA
+        # weights directly.
+        params_on_gpu = self.final_norm.weight.is_cuda
+        if not params_on_gpu:
+            return False                      # pure-CPU inference: nothing to stage
+        if x.device.type != "cuda":
+            return True
+        nbytes = x.numel() * x.element_size()
+        if nbytes < _STREAM_MIN_BYTES:
+            return False                      # small shapes skip the check
+        if x.shape[0] < 2:
+            return False                      # nothing left to split
+        free, _total = torch.cuda.mem_get_info()
+        # Even in fp16 compute the live set runs ~6x the input chunk (qkv is
+        # 3x on its own, plus the fp32 residual).  Deliberately conservative:
+        # the cost of a false positive is one extra chunk boundary, the cost
+        # of a false negative is an OOM.
+        return 6 * nbytes > free * _STREAM_SAFETY
+
+    def _run_streamed(
+        self, x: torch.Tensor, mask_bool: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Forward in batch chunks, staging host-resident inputs if needed.
+
+        Batch elements of a transformer are fully independent -- no operator
+        in this network mixes them -- so chunking the batch is exact, not an
+        approximation.  The output is written into a tensor on the input's own
+        device, so a host-resident input yields a host-resident output and the
+        12.21 GiB pair never has to be VRAM-resident at once.
+        """
+        dev = torch.device("cuda")
+        batch, seq_len, d_model = x.shape
+        host = x.device.type != "cuda"
+
+        # Learn the compute dtype from a one-row probe, size the chunk from
+        # it, then re-prepare against the real chunk shape so every gate in
+        # `_prepare` (graph capture, fused qkv, attention tiling) sees the
+        # batch it will actually run with.
+        self._prepare(x[:1].to(dev) if host else x[:1])
+        step = self._stream_chunk_size(x)
+        # Zero-stride view: correct shape metadata, one element of storage.
+        shim = torch.empty(1, device=dev, dtype=x.dtype).as_strided(
+            (step, seq_len, d_model), (0, 0, 0)
+        )
+        self._prepare(shim)
+        # Chunk shapes differ from the caller's; never let `forward` reuse
+        # this signature for a non-streamed call.
+        self._sig = None
+        del shim
+
+        out = torch.empty_like(x)
+        b0 = 0
+        while b0 < batch:
+            b1 = min(b0 + step, batch)
+            xc = x[b0:b1]
+            mc = None if mask_bool is None else mask_bool[b0:b1]
+            if host:
+                xc = xc.to(dev, non_blocking=True)
+                if mc is not None:
+                    mc = mc.to(dev, non_blocking=True)
+            if xc.shape[0] != step:            # ragged tail
+                self._prepare(xc)
+                self._sig = None
+            apply_mask = mc is not None and not bool(mc.all())
+            try:
+                rc = self._run(xc, mc, apply_mask)
+            except torch.cuda.OutOfMemoryError:
+                # The static estimate is calibrated, not exact.  Halving and
+                # retrying makes the chunk size depend on what the device
+                # actually has rather than on the model being right.
+                del xc, mc
+                gc.collect()
+                torch.cuda.empty_cache()
+                if step == 1:
+                    raise
+                step = max(1, step // 2)
+                shim2 = torch.empty(1, device=dev, dtype=x.dtype).as_strided(
+                    (step, seq_len, d_model), (0, 0, 0)
+                )
+                self._prepare(shim2)
+                self._sig = None
+                del shim2
+                continue
+            out[b0:b1].copy_(rc)
+            del xc, mc, rc
+            b0 = b1
+        return out
+
     # -- entry point ---------------------------------------------------------
 
     def forward(
@@ -1293,6 +1514,13 @@ class UserOptimizedTransformer(BaselineTransformer):
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Shapes whose input/output pair exceeds VRAM are walked in batch
+        # chunks sized from the device's actual free memory.  Checked before
+        # `_prepare` because the chunk shape, not the caller's shape, is what
+        # every gate in `_prepare` must be derived from.
+        if self._should_stream(x):
+            return self._run_streamed(x, valid_token_mask)
+
         if self._packs is None or self._sig != (tuple(x.shape), x.dtype, x.device):
             self._prepare(x)
 
