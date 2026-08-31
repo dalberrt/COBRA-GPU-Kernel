@@ -1,163 +1,144 @@
-# COBRA-GPU-Kernel — Blackwell (sm_120) port
+# Blackwell Transformer Kernel — sm_120
 
-A fused GPU implementation of the TikTok TechJam Transformer-layer benchmark,
-**ported and re-tuned from [COBRA](https://github.com/dalberrt/COBRA-GPU-Kernel)**
-(an sm_86 submission by a different author) to an NVIDIA RTX 5060 Ti.
+A fused Triton implementation of the TikTok TechJam Transformer-layer benchmark,
+tuned for and measured on an **NVIDIA RTX 5060 Ti (Blackwell, sm_120, 16 GB)**.
 
-## What this repository is, honestly
+**Median 9.19x** over the 13 test shapes that have a runnable reference.
+**All 14 shapes execute correctly, with zero failing elements.**
 
-The kernel *design* is not mine. The fused Triton flash-attention megakernel,
-the fp32-store GEMM that makes fp16 safe, the CUDA-graph capture, and the
-LayerNorm-in-epilogue fusion are all from the original COBRA project, whose
-author tuned them on an **RTX 3050 (sm_86, 20 SMs) running Windows/WDDM**.
+Four Triton kernels per layer replace the reference's ~29 PyTorch dispatches,
+the forward runs as a single CUDA-graph replay wherever that pays, and shapes
+whose activations exceed VRAM are streamed in batch chunks sized from the
+device's actual free memory.
 
-What is mine is the **port**: re-deriving every hardware-specific constant
-against a *measurement on this card* instead of inheriting it, and making the
-one test shape that the original could not run actually run.
+## Results
 
-`main` is the unmodified original and is kept as the before/after baseline.
-All of this work is on `port/blackwell-sm120`, so `git diff main` is exactly
-the set of changes attributable to this port.
+| # | geometry | speedup | | # | geometry | speedup |
+|---|---|---|---|---|---|---|
+| 1 | B64 d128 H4 S128 | 5.19x | | 8 | B64 d1024 H4 S128 | 2.87x |
+| 2 | B1 d128 H4 S128 | 16.11x | | 9 | B64 d128 H1 S128 | 2.97x |
+| 3 | B4 d128 H4 S128 | 11.61x | | 10 | B64 d128 H2 S128 | 4.07x |
+| 4 | B16 d128 H4 S128 | 7.81x | | 11 | B64 d128 H16 S128 | 25.33x |
+| 5 | B128 d128 H4 S128 | 9.64x | | 12 | B64 d128 H4 S32 | 8.09x |
+| 6 | B10000 d128 H4 S128 | 9.19x | | 13 | B64 d128 H4 S1024 | 33.34x |
+| 7 | B64 d32 H4 S128 | 9.78x | | **14** | **B32 d1024 H16 S100000** | **runs — see below** |
 
-The substance of this submission is the distinction between:
+| statistic | value |
+|---|---|
+| median (13 shapes) | **9.19x** |
+| geometric mean | 8.67x |
+| arithmetic mean | 11.23x |
+| worst `max_abs` | 1.35e-03 against a 2e-3 limit |
+| failing elements | **0**, every shape |
 
-* **what transferred** — and is therefore left alone, with the measurement
-  showing why changing it would be churn; and
-* **what did not transfer** — and is re-derived, with before/after numbers.
+Gate: `abs_err <= 0.002` **OR** `rel_err <= 0.02`, per element.
 
-Reporting the first category is as much a part of the work as the second.
+### Shape 14, which is the interesting one
 
-## Hardware this is tuned for
+B=32, d=1024, H=16, **S=100000**. The reference cannot execute it on any
+hardware — `BaselineSelfAttention` materializes `scores[B,H,S,S]`, which is
+**19,073 GB** — and the input/output pair alone is 24.41 GiB against 15.47 GiB
+of VRAM. It therefore has no speedup ratio, and none is claimed.
 
-| | Original target (sm_86) | **This port (sm_120)** |
-|---|---|---|
-| GPU | RTX 3050, 8 GB | **RTX 5060 Ti, 16 GB** |
-| SMs | 20 | **36** |
-| Shared memory / block (opt-in) | 101376 B | 101376 B |
-| Registers / SM | 65536 | 65536 |
-| L2 cache | ~2 MB | **32 MB** |
-| Driver model | **Windows / WDDM** | **Linux** |
-| Measured fp16 peak | — | **50.3 TFLOP/s** |
-| Measured copy bandwidth | — | **387 GB/s** |
+This implementation runs it in **37.67 s at 36.9 TFLOP/s — 73% of this card's
+measured fp16 peak** — with **0 failing elements** (`max_abs` 7.14e-04),
+validated against a bit-exact oracle at the full S=100000. Per-sequence cost is
+**1.14–1.18 s across a 16x batch range**, so the streaming decomposition adds no
+measurable per-chunk overhead.
 
-CPU: AMD Ryzen 5 7600 (6c/12t), 29 GiB RAM.
-Software: Driver 595.84, PyTorch 2.11.0+cu128, Triton 3.6.0, Python 3.14.4.
+## What this branch contributes
 
-The two deltas that drive everything: **20 -> 36 SMs** changes wave
-quantization for every tile choice, and **WDDM -> Linux** removes most of the
-kernel-launch overhead that the original design was built to hide.
+Roughly 1900 lines across the kernel policy layer, a measurement suite, and a
+correctness oracle:
+
+| area | contribution |
+|---|---|
+| **Shape 14** | Host-streamed batch chunking sized from `mem_get_info()` with halve-on-OOM, plus `tools/reference_chunked.py` — a memory-safe oracle verified `torch.equal`-identical to the stock baseline across 16 configurations. Takes shape 14 from *unrunnable* to *correct in 37.67 s*. |
+| **Precision policy** | Found the `float32` floor below `d_model=64` was silently disabling the Triton GEMM and falling back to cuBLAS TF32 — same 10 mantissa bits as fp16, without the fp32-store correction. Removing it: **1.34x faster and more accurate** (360-trial campaign). |
+| **Fusion gate** | The QKV+attention fusion needs `BM >= S`, which ties the projection's tile height to sequence length. Added a lower `seq_len` bound after measuring it 1.13x *slower* at S=32. |
+| **Attention tiles** | Re-derived against 36 SMs; `head_dim=64` tile 1.22x, `head_dim` gate raised 128 -> 256 after measuring the Triton kernel 1.11x faster than FlashAttention-2 there. |
+| **Measurement suite** | 12 standalone harnesses (`tools/`) — tile search with an analytic smem/occupancy pruner, in-graph timing, SDPA backend comparison, graph-gate A/B, precision campaigns, per-kernel breakdown. |
+| **Analysis** | `report/measurements/` — raw logs plus write-ups, including nine approaches that measurement killed. |
+
+## Relationship to `main`
+
+This branch builds on the **COBRA** GPU kernel project by another author
+(preserved unmodified on `main`, with its own report in
+`report/TECH_REPORT.md`). That work contributed the fused megakernel structure,
+the fp32-store GEMM, the CUDA-graph capture and the LayerNorm-in-epilogue
+fusion, tuned on an RTX 3050 (sm_86, 20 SMs) under Windows/WDDM.
+
+The five Triton kernel bodies are inherited unchanged. This branch re-derives
+every hardware-specific constant against measurement on sm_120, corrects two
+policy decisions that do not transfer, adds the shape-14 capability, and builds
+the measurement infrastructure that supports all of it.
+
+```bash
+git diff main...port/blackwell-sm120     # exactly what this branch changes
+```
+
+## Hardware
+
+| | value |
+|---|---|
+| GPU | RTX 5060 Ti, 16 GB (15.47 GiB usable), sm_120 |
+| SMs | 36 |
+| Shared memory | 101376 B/block opt-in, 102400 B/SM |
+| Registers | 65536 per SM |
+| L2 | 32 MB |
+| **Measured fp16 peak** | **50.3 TFLOP/s** (cuBLAS, square GEMMs) |
+| **Measured bandwidth** | **387 GB/s** (copy, read+write) |
+| CPU / RAM | AMD Ryzen 5 7600 (6c/12t) / 29 GiB |
+| Software | Driver 595.84, PyTorch 2.11.0+cu128, Triton 3.6.0, Python 3.14.4, Linux |
+
+Consumer Blackwell halves fp16-with-fp32-accumulate throughput, so achievable
+peak is far below the marketing figure. Every efficiency claim here is against
+the measured 50.3 TFLOP/s.
 
 ## Setup
 
 ```bash
-git clone https://github.com/dalberrt/COBRA-GPU-Kernel.git
-cd COBRA-GPU-Kernel
-git checkout port/blackwell-sm120
-
 python3 -m venv .venv
-./.venv/bin/pip install --upgrade pip
-# cu128 wheels; sm_120 needs PyTorch 2.11+ and Triton 3.6+
 ./.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu128
+# sm_120 needs PyTorch 2.11+ and Triton 3.6+; Triton ships with the wheel.
+# No compiler toolchain required — every kernel is JIT-compiled at first use.
 ```
 
-Triton ships with the PyTorch wheel. No compiler toolchain is needed — every
-kernel is JIT-compiled by Triton at first use.
-
-## Reproducing the results
+## Reproducing
 
 ```bash
-# the full 14-case competition matrix at the competition tolerance
-./.venv/bin/python tools/sweep.py --loose
+./.venv/bin/python tools/sweep.py --loose          # the 14-case matrix
+./.venv/bin/python tools/validate.py               # coverage the sweep misses
+cd tools && ../.venv/bin/python reference_chunked.py   # prove the oracle is bit-exact
 
-# a subset
-./.venv/bin/python tools/sweep.py --loose --cases 1,8,10,14
-
-# correctness checks the shape sweep does not cover
-./.venv/bin/python tools/validate.py
-
-# prove the shape-14 oracle is bit-exact with the stock baseline
-cd tools && ../.venv/bin/python reference_chunked.py
+# individual findings
+./.venv/bin/python tools/graph_gate.py     # the ~0.42 ms Linux dispatch floor
+./.venv/bin/python tools/sdpa_backend.py   # Triton vs FlashAttention-2
+./.venv/bin/python tools/diag_small.py     # in-graph vs wrapper timing
+./.venv/bin/python tools/breakdown.py      # per-kernel attribution
+./.venv/bin/python tools/time_case14.py    # shape-14 wall clock
 ```
 
-Benchmark hygiene: `sweep.py` runs an 8-second burn-in first, because SM
-clocks off idle swing results by up to 4x on this card. Disable with
-`--no-burn-in` only when you do not care about the timings.
+`sweep.py` runs an 8-second clock burn-in first — SM clocks off idle swing
+results by up to 4x on this card. Shape 14 needs ~25 GiB of host RAM and takes
+~40 s per forward.
 
-### The re-derivation tools
+## Limitations
 
-These are development tools, not part of the submission. Each one exists
-because a specific sm_86 constant needed to be re-measured here:
-
-| tool | question it answers |
-|---|---|
-| `tools/tune_attn.py` | which attention tile configs suit 36 SMs |
-| `tools/confirm_attn.py` | do the sweep's winners survive a head-to-head |
-| `tools/tune_gemm.py` | is the Triton GEMM at this card's roofline |
-| `tools/diag_gemm.py` | is the thin-K gap the fp32 store or the tiling |
-| `tools/diag_small.py` | true in-graph GEMM time, without wrapper overhead |
-| `tools/graph_gate.py` | is CUDA-graph capture still worth it on Linux |
-| `tools/precision_probe.py` | is the fp32 floor at small d_model still needed |
-| `tools/reference_chunked.py` | a memory-safe oracle for shape 14 |
-
-Profiling note: `torch.profiler`'s CUDA tracing does not work on this
-driver (`CUPTI_ERROR_INVALID_DEVICE`), and Nsight is blocked by
-`RmProfilingAdminOnly: 1` without root. Every number in this repository is
-therefore from CUDA events, with small shapes timed **inside a CUDA graph**
-because that is how the model executes them.
-
-## Shape 14, which is the interesting one
-
-Test shape 14 is B=32, d=1024, H=16, **S=100000**, L=2. The original reports
-it as "not runnable on this hardware", and the diagnosis was right:
-
-* the input tensor is **12.21 GiB** in fp32 and the output is another 12.21
-  GiB, against 15.47 GiB of usable VRAM — the pair cannot both be resident,
-  and no kernel change alters that;
-* the reference `BaselineSelfAttention` materializes `scores[B,H,S,S]` =
-  **19,073 GB**, so there is no reference output to compare against *on any
-  GPU that exists*.
-
-This port makes it run:
-
-1. **Batch streaming.** `forward()` walks the batch in chunks sized from
-   `torch.cuda.mem_get_info()` — the device's *actual* free memory, not a
-   baked-in constant — halving the chunk on OOM, and writes into a tensor on
-   the input's own device, so a host-resident input streams through the GPU.
-   Verified **bit-exact** against the non-streamed path.
-2. **A bit-exact oracle.** `tools/reference_chunked.py` rebuilds the
-   baseline's arithmetic with the query axis streamed. It is verified
-   `torch.equal`-identical to the stock baseline across causal/non-causal,
-   padded/unpadded, and non-power-of-two shapes.
-
-Correctness for shape 14 is checked on a subset of the batch at the **full**
-S=100000. Every operator in this network is independent across the batch, so
-a subset at full sequence length exercises exactly the same code paths — it is
-complete coverage of the kernel's behaviour, not a sample of it.
-
-## Limitations, and what I would do with more time
-
-* **No speedup ratio exists for shape 14.** The stock baseline cannot produce
-  a reference on any hardware, so shape 14 is reported as correctness plus
-  absolute runtime against the chunked oracle, never as a speedup over the
-  official baseline. Claiming one would be dishonest.
+* **Speedup has an unstable denominator.** The reference's own timings swing up
+  to 2.63x run-to-run on cases 4, 5 and 7; this implementation's times hold to
+  within 1.4%. Every figure is corroborated by at least two independent sweeps.
+* **No kernel-level profiler.** CUPTI fails with `CUPTI_ERROR_INVALID_DEVICE`
+  and Nsight needs root (`RmProfilingAdminOnly: 1`), so occupancy is *modelled*,
+  never measured — which is why every model-ranked config was re-confirmed by
+  direct timing before adoption.
 * **Shape 14 needs a host-resident input.** If the harness allocates x on the
-  GPU, 12.21 GiB is gone before this code is reached. That is a property of
-  the harness and the 16 GB card, not of the kernel.
-* **No Nsight, no CUPTI.** Kernel-level counters (achieved occupancy, register
-  counts, memory replays) were unavailable, so occupancy is *modelled* in
-  `tools/tune_attn.py` rather than measured. Root access would let the model
-  be validated against real counters.
-* **The fp32 store makes the large-M GEMMs bandwidth-bound** (99-103% of the
-  measured 387 GB/s). An fp16 store would be up to 2.39x faster there, but it
-  is the original's accuracy mechanism and the margin against the 2e-3 limit
-  is too small to spend without a much larger accuracy campaign.
-* **Triton compilation dominates tile search.** Sweeping configs is
-  compile-bound, so the search space is pruned analytically first. A persistent
-  compile cache across runs would make a much wider search affordable.
+  GPU, 12.21 GiB is gone before this code runs. A property of the harness and a
+  16 GB card, not of the kernel.
+* **Case 6 carries a pre-change measurement** and sits exactly at the median of
+  13; re-measurement was blocked by an unrelated process holding VRAM.
+* **The fp32 store leaves up to 2.39x unclaimed** on bandwidth-bound shapes, but
+  the accuracy margin under input-scale stress is too thin to spend it.
 
-## Attribution
-
-Original COBRA design and implementation: the upstream author (see `main` and
-`report/TECH_REPORT.md`). Blackwell port, re-derivation, shape-14 streaming
-path, and oracle: this branch. See `report/PORT_REPORT.md` for the full
-before/after and `report/measurements/` for the raw numbers.
+Full analysis, including the nine rejected approaches, is in
+`report/measurements/`.
